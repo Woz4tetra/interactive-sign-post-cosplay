@@ -93,4 +93,3 @@ Edit the constants at the top of `src/main.cpp`:
   `platformio.ini` to `adafruit_qtpy_esp32s3_n4r2`.
 - Serial runs over native USB (`ARDUINO_USB_CDC_ON_BOOT=1`), which also frees
   the TX pad for the battery ADC reading.
-# interactive-sign-post-cosplay
