@@ -19,6 +19,7 @@
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+#include <Adafruit_NeoPixel.h>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -36,16 +37,20 @@ static const int PIN_VBAT     = TX;
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
-static const float    AUDIO_GAIN  = 0.7f;   // 0.0 - 1.0
-static const float    TIP_TRIGGER = 0.55f;  // cos(~57 deg): tipped far enough to fire
-static const float    TIP_REARM   = 0.90f;  // cos(~26 deg): back near upright to re-arm
+static const float    AUDIO_GAIN  = 1.0f;   // 0.0 - 1.0
+static const float    TIP_TRIGGER = 0.0f;  // cos(~57 deg): tipped far enough to fire
+static const float    TIP_REARM   = 0.6f;  // cos(~26 deg): back near upright to re-arm
 static const uint32_t BATT_PERIOD = 30000;  // ms between battery prints
 static const uint32_t SAMPLE_MS   = 20;     // accelerometer poll period
+static const uint8_t  LED_BRIGHTNESS = 40;    // onboard NeoPixel brightness (0-255)
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 Adafruit_ADXL343 accel = Adafruit_ADXL343(343, &Wire1);
+
+// Onboard NeoPixel (single RGB pixel) used as a status light.
+Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
 AudioGeneratorWAV *wav  = nullptr;
 AudioFileSourceSD *file = nullptr;
@@ -59,6 +64,22 @@ uint32_t lastBatt = 0;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Set the onboard NeoPixel to an RGB color. Brightness is scaled globally by
+// LED_BRIGHTNESS, so pass full 0-255 components here.
+static void ledSet(uint8_t r, uint8_t g, uint8_t b) {
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+// Live tip readout: green when upright, fading through yellow to red as the
+// sign leans toward the trigger threshold. dot is cos(angle from upright).
+static void ledTipReadout(float dot) {
+  float frac = (dot - TIP_TRIGGER) / (1.0f - TIP_TRIGGER);
+  if (frac < 0.0f) frac = 0.0f;
+  if (frac > 1.0f) frac = 1.0f;
+  ledSet((uint8_t)(255 * (1.0f - frac)), (uint8_t)(255 * frac), 0);
+}
 
 // Read the current gravity direction as a unit vector. Returns false if the
 // accelerometer read fails or the magnitude is implausibly small.
@@ -92,6 +113,11 @@ static void scanSounds() {
         if (!name.startsWith("/")) name = "/" + name;
         sounds.push_back(name);
         Serial.printf("[sd] found %s\n", name.c_str());
+        // Blink the status LED once per file found so load progress is visible.
+        ledSet(0, 255, 0);
+        delay(40);
+        ledSet(0, 0, 0);
+        delay(40);
       }
     }
     f.close();
@@ -118,6 +144,8 @@ static void startRandomSound() {
   if (!wav->begin(file, out)) {
     Serial.println("[play] failed to start");
     stopSound();
+  } else {
+    ledSet(255, 0, 255); // magenta while a clip is playing
   }
 }
 
@@ -133,6 +161,14 @@ void setup() {
   delay(1000);
   Serial.println("\nTip-to-play sign starting");
 
+  // Onboard NeoPixel as a status light. The QT Py gates pixel power on a
+  // dedicated pin that must be driven high before the pixel will light.
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, HIGH);
+  pixel.begin();
+  pixel.setBrightness(LED_BRIGHTNESS);
+  ledSet(0, 0, 0);
+
   analogReadResolution(12);
 
   // Accelerometer on the STEMMA QT port (Wire1 on this board).
@@ -146,11 +182,18 @@ void setup() {
   }
 
   // microSD over the default SPI bus.
+  ledSet(0, 0, 255); // blue: reading the card
   SPI.begin(SCK, MISO, MOSI, PIN_SD_CS);
   if (!SD.begin(PIN_SD_CS)) {
     Serial.println("[sd] card init failed");
+    ledSet(255, 0, 0); // red: no card / init failed
+    delay(800);
   } else {
     scanSounds();
+    // Hold a summary color: green if clips loaded, amber if the card is fine
+    // but empty. Overwritten by the live tip readout once the loop starts.
+    ledSet(sounds.empty() ? 255 : 0, sounds.empty() ? 120 : 255, 0);
+    delay(500);
   }
 
   // I2S output to the MAX98357 amp on the Audio BFF.
@@ -185,6 +228,9 @@ void loop() {
   if (readGravity(x, y, z)) {
     // Dot product of two unit vectors == cosine of the angle from upright.
     float dot = x * refX + y * refY + z * refZ;
+    Serial.print("[tip] angle: ");
+    Serial.println(dot);
+    ledTipReadout(dot); // live orientation readout (green upright -> red tipped)
     if (armed && dot < TIP_TRIGGER) {
       armed = false;
       startRandomSound();

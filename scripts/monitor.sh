@@ -16,4 +16,4 @@ fi
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 
-pio device monitor "$@"
+pio device monitor "$@" --baud 115200
