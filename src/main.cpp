@@ -43,7 +43,7 @@ static const int PIN_VBAT     = TX;
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
-static const float    AUDIO_GAIN  = 1.0f;   // 0.0 - 1.0
+static const float    AUDIO_GAIN_DEFAULT = 1.0f; // 0.0 - 1.0, adjustable in UI
 static const uint32_t BATT_PERIOD = 30000;  // ms between battery prints
 static const uint32_t SAMPLE_MS   = 20;     // accelerometer poll period
 static const uint8_t  LED_BRIGHTNESS = 40;    // onboard NeoPixel brightness (0-255)
@@ -51,6 +51,13 @@ static const uint8_t  LED_BRIGHTNESS = 40;    // onboard NeoPixel brightness (0-
 // LiPo voltage range for the battery gauge (1S cell).
 static const float BATT_EMPTY = 3.30f;
 static const float BATT_FULL  = 4.20f;
+
+// USB-power detection. The Charger BFF divider senses the 5V rail through a
+// schottky diode, so with USB plugged in it reads ~4.6-4.7V (5V minus the
+// drop) - higher than even a full 4.2V battery. Hysteresis avoids flicker near
+// the boundary. Tune on the bench if your diode drop differs.
+static const float USB_ON_V  = 4.50f;  // rail above this => USB present
+static const float USB_OFF_V = 4.35f;  // rail below this => on battery
 
 // Tilt thresholds default to these angles (degrees from upright). The live
 // values are adjustable from the web UI and persisted to the SD card. Defaults
@@ -93,6 +100,7 @@ std::vector<String>    disabledNames;  // paths muted via the web UI
 
 float    refX = 0, refY = 0, refZ = 1;  // upright gravity reference (unit vector)
 bool     armed = true;
+bool     usbPowered = false;  // true while running on USB power (sounds muted)
 uint32_t lastBatt = 0;
 
 // Live tilt thresholds in degrees (see defaults above), plus their cached
@@ -101,6 +109,9 @@ float tipTriggerDeg = TRIGGER_DEG_DEFAULT;
 float tipRearmDeg   = REARM_DEG_DEFAULT;
 float tipTriggerDot = 0.0f;
 float tipRearmDot   = 0.6f;
+
+// Playback volume (0.0 - 1.0). Adjustable from the web UI and persisted.
+float audioGain = AUDIO_GAIN_DEFAULT;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -185,11 +196,14 @@ static void loadConfig() {
       String val = line.substring(eq + 1);     val.trim();
       if      (key == "trigger") tipTriggerDeg = val.toFloat();
       else if (key == "rearm")   tipRearmDeg   = val.toFloat();
+      else if (key == "gain")    audioGain     = val.toFloat();
     }
     f.close();
   }
   applyThresholds();
-  Serial.printf("[cfg] trigger=%.1f deg, rearm=%.1f deg\n", tipTriggerDeg, tipRearmDeg);
+  audioGain = constrain(audioGain, 0.0f, 1.0f);
+  Serial.printf("[cfg] trigger=%.1f deg, rearm=%.1f deg, gain=%.2f\n",
+                tipTriggerDeg, tipRearmDeg, audioGain);
 }
 
 // Rewrite the settings file on the SD card.
@@ -201,12 +215,28 @@ static void saveConfig() {
   }
   f.printf("trigger=%.1f\n", tipTriggerDeg);
   f.printf("rearm=%.1f\n", tipRearmDeg);
+  f.printf("gain=%.2f\n", audioGain);
   f.close();
 }
 
-// Build the list of WAV files from the SD card root, marking each enabled
-// unless it appears in the muted list. showProgress blinks the LED per file.
-static void scanSounds(bool showProgress = false) {
+// Append a directory entry to the sound list if it is an enabled-or-muted WAV.
+static void addSoundEntry(File &f) {
+  if (f.isDirectory()) return;
+  String name = f.name();
+  String lower = name;
+  lower.toLowerCase();
+  if (!lower.endsWith(".wav")) return;
+  if (!name.startsWith("/")) name = "/" + name;
+  SoundFile sf;
+  sf.name = name;
+  sf.enabled = !isNameDisabled(name);
+  sounds.push_back(sf);
+  Serial.printf("[sd] found %s (%s)\n", name.c_str(), sf.enabled ? "on" : "off");
+}
+
+// Enumerate all WAV files on the SD root. Blocking; run once at boot and again
+// after web-driven changes (upload/delete) so the list is always complete.
+static void scanSounds() {
   sounds.clear();
   File root = SD.open("/");
   if (!root) {
@@ -214,26 +244,7 @@ static void scanSounds(bool showProgress = false) {
     return;
   }
   for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    if (!f.isDirectory()) {
-      String name = f.name();
-      String lower = name;
-      lower.toLowerCase();
-      if (lower.endsWith(".wav")) {
-        if (!name.startsWith("/")) name = "/" + name;
-        SoundFile sf;
-        sf.name = name;
-        sf.enabled = !isNameDisabled(name);
-        sounds.push_back(sf);
-        Serial.printf("[sd] found %s (%s)\n", name.c_str(), sf.enabled ? "on" : "off");
-        if (showProgress) {
-          // Blink once per file so boot load progress is visible on the LED.
-          ledSet(0, 255, 0);
-          delay(40);
-          ledSet(0, 0, 0);
-          delay(40);
-        }
-      }
-    }
+    addSoundEntry(f);
     f.close();
   }
   root.close();
@@ -245,7 +256,9 @@ static void stopSound() {
   if (file) { delete file; file = nullptr; }
 }
 
-// Start playing a randomly chosen clip. Does nothing if no file is enabled.
+// Start playing a randomly chosen clip. The file is opened here, right before
+// playback begins, so nothing touches the SD card mid-stream. Does nothing if
+// no file is enabled.
 static void startRandomSound() {
   std::vector<int> playable;
   for (size_t i = 0; i < sounds.size(); i++)
@@ -268,7 +281,10 @@ static void startRandomSound() {
 
 static float batteryVolts() {
   // The Charger BFF divider halves the pack voltage, so double the reading.
-  return (analogReadMilliVolts(PIN_VBAT) * 2) / 1000.0f;
+  // Average a handful of samples to steady the ADC noise.
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_VBAT);
+  return (mv / 8 * 2) / 1000.0f;
 }
 
 static int batteryPercent(float v) {
@@ -280,7 +296,17 @@ static int batteryPercent(float v) {
 
 static void printBattery() {
   float v = batteryVolts();
-  Serial.printf("[batt] %.2f V (%d%%)\n", v, batteryPercent(v));
+  Serial.printf("[batt] %.2f V (%d%%)%s\n", v, batteryPercent(v),
+                usbPowered ? " [USB]" : "");
+}
+
+// Decide whether we're on USB power from the rail voltage, with hysteresis.
+// Falls through to "on battery" if the monitor is unwired (reads ~0), so a
+// missing sense line never wrongly mutes the sign.
+static void updatePowerSource() {
+  float v = batteryVolts();
+  if (!usbPowered && v > USB_ON_V)       usbPowered = true;
+  else if (usbPowered && v < USB_OFF_V)  usbPowered = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +358,7 @@ static const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
   button:hover::before{content:'\2764 ';color:#f00}
   button.on{color:#ff0;border-color:#ff0}
   button.del:hover{color:#f55;border-color:#f55}
-  .upload{margin-top:14px;border-top:2px dashed #444;padding-top:12px}
+  .upload{margin-bottom:14px;border-bottom:2px dashed #444;padding-bottom:12px}
   input[type=file]{color:#fff;font-family:inherit;margin-top:8px}
   input[type=range]{flex:1;accent-color:#ff0;height:16px;cursor:pointer}
   .hint{color:#888;font-size:12px;margin-top:8px}
@@ -355,13 +381,19 @@ static const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
       <span class="batt-pct" id="battPct">--%</span>
       <span class="batt-v" id="battV">--V</span>
     </div>
+    <div class="row"><span class="label">POWER</span><span class="val" id="power">--</span></div>
     <div class="row"><span class="label">TILT</span><span class="val" id="tilt">--</span></div>
     <div class="row"><span class="label">ACCEL</span><span class="val" id="accel">--</span></div>
     <div class="row"><span class="label">STATUS</span><span class="val" id="armed">--</span></div>
   </div>
 
   <div class="box">
-    <h2>* TILT SETTINGS</h2>
+    <h2>* SETTINGS</h2>
+    <div class="row">
+      <span class="label">VOLUME</span>
+      <input type="range" id="volRange" min="0" max="100" step="1">
+      <span class="val" id="volVal" style="width:52px;text-align:right">--%</span>
+    </div>
     <div class="row">
       <span class="label">FIRE AT</span>
       <input type="range" id="trigRange" min="10" max="170" step="1">
@@ -380,13 +412,13 @@ static const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
 
   <div class="box">
     <h2>* SOUND FILES</h2>
-    <div id="files"><div class="hint">* loading...</div></div>
     <div class="upload">
       <div class="row"><span class="star">*</span>ADD A NEW SOUND (.WAV)</div>
       <input type="file" id="fileInput" accept=".wav">
       <button id="uploadBtn">UPLOAD</button>
       <div class="hint" id="uploadHint"></div>
     </div>
+    <div id="files"><div class="hint">* loading...</div></div>
   </div>
 
   <div class="overlay hidden" id="modal">
@@ -448,11 +480,14 @@ static const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
       $('battFill').style.width=s.battPct+'%';
       $('battPct').textContent=s.battPct+'%';
       $('battV').textContent=s.battV.toFixed(2)+'V';
+      $('power').textContent=s.usb?'USB (sounds muted)':'BATTERY';
       $('tilt').textContent=s.tipAngle.toFixed(1)+'°  (dot '+s.tipDot.toFixed(2)+')';
       $('accel').textContent='x:'+s.accel.x.toFixed(2)+'  y:'+s.accel.y.toFixed(2)+'  z:'+s.accel.z.toFixed(2);
       $('armed').textContent=s.armed?'ARMED':'TRIGGERED';
       // Populate the sliders once so periodic refreshes don't fight the user.
       if(!settingsLoaded){
+        const vp=Math.round(s.gain*100);
+        $('volRange').value=vp;$('volVal').textContent=vp+'%';
         $('trigRange').value=s.triggerDeg;$('trigVal').textContent=s.triggerDeg.toFixed(0)+'°';
         $('rearmRange').value=s.rearmDeg;$('rearmVal').textContent=s.rearmDeg.toFixed(0)+'°';
         settingsLoaded=true;
@@ -461,11 +496,12 @@ static const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
     }catch(e){/* a clip is probably playing; try again next tick */}
   }
 
+  $('volRange').oninput=()=>$('volVal').textContent=$('volRange').value+'%';
   $('trigRange').oninput=()=>$('trigVal').textContent=$('trigRange').value+'°';
   $('rearmRange').oninput=()=>$('rearmVal').textContent=$('rearmRange').value+'°';
   $('saveBtn').onclick=async()=>{
-    const t=$('trigRange').value,r=$('rearmRange').value;
-    await fetch('/api/settings?trigger='+t+'&rearm='+r,{method:'POST'});
+    const g=($('volRange').value/100).toFixed(2),t=$('trigRange').value,r=$('rearmRange').value;
+    await fetch('/api/settings?gain='+g+'&trigger='+t+'&rearm='+r,{method:'POST'});
     toast('Settings saved');
     settingsLoaded=false;refresh();  // re-pull in case values were clamped
   };
@@ -501,6 +537,7 @@ static void handleStatus() {
   String json = "{";
   json += "\"battV\":" + String(v, 2) + ",";
   json += "\"battPct\":" + String(batteryPercent(v)) + ",";
+  json += "\"usb\":" + String(usbPowered ? "true" : "false") + ",";
   json += "\"armed\":" + String(armed ? "true" : "false") + ",";
   json += "\"accel\":{\"x\":" + String(x, 2) + ",\"y\":" + String(y, 2) +
           ",\"z\":" + String(z, 2) + "},";
@@ -508,6 +545,7 @@ static void handleStatus() {
   json += "\"tipAngle\":" + String(ang, 1) + ",";
   json += "\"triggerDeg\":" + String(tipTriggerDeg, 1) + ",";
   json += "\"rearmDeg\":" + String(tipRearmDeg, 1) + ",";
+  json += "\"gain\":" + String(audioGain, 2) + ",";
   json += "\"files\":[";
   for (size_t i = 0; i < sounds.size(); i++) {
     if (i) json += ",";
@@ -571,14 +609,18 @@ static void handleToggle() {
 static void handleSettings() {
   if (server.hasArg("trigger")) tipTriggerDeg = server.arg("trigger").toFloat();
   if (server.hasArg("rearm"))   tipRearmDeg   = server.arg("rearm").toFloat();
+  if (server.hasArg("gain"))    audioGain     = server.arg("gain").toFloat();
   // Clamp to a sane range and keep hysteresis: re-arm must be nearer upright
   // (a smaller angle) than the fire threshold, or the sign could lock up.
   tipTriggerDeg = constrain(tipTriggerDeg, 10.0f, 170.0f);
   tipRearmDeg   = constrain(tipRearmDeg,    0.0f, 170.0f);
   if (tipRearmDeg > tipTriggerDeg) tipRearmDeg = tipTriggerDeg;
+  audioGain = constrain(audioGain, 0.0f, 1.0f);
   applyThresholds();
+  if (out) out->SetGain(audioGain);  // takes effect immediately
   saveConfig();
-  Serial.printf("[cfg] trigger=%.1f deg, rearm=%.1f deg\n", tipTriggerDeg, tipRearmDeg);
+  Serial.printf("[cfg] trigger=%.1f deg, rearm=%.1f deg, gain=%.2f\n",
+                tipTriggerDeg, tipRearmDeg, audioGain);
   server.send(200, "text/plain", "saved");
 }
 
@@ -636,9 +678,8 @@ void setup() {
   } else {
     loadDisabled();
     loadConfig();
-    scanSounds(true);
-    // Hold a summary color: green if clips loaded, amber if the card is fine
-    // but empty. Overwritten by the live tip readout once the loop starts.
+    scanSounds();
+    // Summary color: green if clips loaded, amber if the card is fine but empty.
     ledSet(sounds.empty() ? 255 : 0, sounds.empty() ? 120 : 255, 0);
     delay(500);
   }
@@ -646,7 +687,7 @@ void setup() {
   // I2S output to the MAX98357 amp on the Audio BFF.
   out = new AudioOutputI2S();
   out->SetPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DIN);
-  out->SetGain(AUDIO_GAIN);
+  out->SetGain(audioGain);  // loaded from config above (default if none)
 
   // Capture the current orientation as "upright". Hold the sign upright at
   // boot; tip detection is measured relative to this reference, so the mounting
@@ -676,6 +717,7 @@ void loop() {
   }
 
   server.handleClient();
+  updatePowerSource();
 
   float x, y, z;
   if (readGravity(x, y, z)) {
@@ -683,10 +725,13 @@ void loop() {
     float dot = x * refX + y * refY + z * refZ;
     Serial.print("[tip] angle: ");
     Serial.println(dot);
-    ledTipReadout(dot); // live orientation readout (green upright -> red tipped)
+    if (usbPowered) ledSet(40, 40, 40);  // dim white: on USB, playback muted
+    else            ledTipReadout(dot);  // live orientation readout
     if (armed && dot < tipTriggerDot) {
       armed = false;
-      startRandomSound();
+      // Suppress playback while on USB power (bench / charging).
+      if (usbPowered) Serial.println("[play] suppressed (USB power)");
+      else            startRandomSound();
     } else if (!armed && dot > tipRearmDot) {
       armed = true;
       Serial.println("[tip] re-armed");
